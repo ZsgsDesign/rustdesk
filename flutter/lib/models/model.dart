@@ -2274,6 +2274,12 @@ class CanvasModel with ChangeNotifier {
   double get y => _y;
   double get scale => _scale;
   double get devicePixelRatio => _devicePixelRatio;
+
+  // Mobile only: viewport locked to the central crop of the remote display.
+  bool get isFixedViewport =>
+      isMobile &&
+      kMobileFixedViewportAspectRatio != null &&
+      parent.target?.connType == ConnType.defaultConn;
   Size get size => _size;
   ScrollStyle get scrollStyle => _scrollStyle;
   ViewStyle get viewStyle => _lastViewStyle;
@@ -2421,6 +2427,24 @@ class CanvasModel with ChangeNotifier {
   }
 
   _resetCanvasOffset(int displayWidth, int displayHeight) {
+    if (isFixedViewport &&
+        displayWidth > 0 &&
+        displayHeight > 0 &&
+        _size.width > 0 &&
+        _size.height > 0) {
+      final ratio = kMobileFixedViewportAspectRatio!;
+      var cropWidth = displayWidth.toDouble();
+      var cropHeight = displayHeight.toDouble();
+      if (cropWidth / cropHeight > ratio) {
+        cropWidth = cropHeight * ratio;
+      } else {
+        cropHeight = cropWidth / ratio;
+      }
+      _scale = min(_size.width / cropWidth, _size.height / cropHeight);
+      _x = (_size.width - displayWidth * _scale) / 2;
+      _y = (_size.height - displayHeight * _scale) / 2;
+      return;
+    }
     _x = (size.width - displayWidth * _scale) / 2;
     _y = (size.height - displayHeight * _scale) / 2;
     if (isMobile) {
@@ -2523,6 +2547,9 @@ class CanvasModel with ChangeNotifier {
   }
 
   void moveDesktopMouse(double x, double y) {
+    if (isFixedViewport) {
+      return;
+    }
     if (size.width == 0 || size.height == 0) {
       return;
     }
@@ -2677,6 +2704,9 @@ class CanvasModel with ChangeNotifier {
   }
 
   panX(double dx) {
+    if (isFixedViewport) {
+      return;
+    }
     _x += dx;
     if (isMobile) {
       isMobileCanvasChanged = true;
@@ -2694,6 +2724,9 @@ class CanvasModel with ChangeNotifier {
   }
 
   panY(double dy) {
+    if (isFixedViewport) {
+      return;
+    }
     _y += dy;
     if (isMobile) {
       isMobileCanvasChanged = true;
@@ -2703,6 +2736,7 @@ class CanvasModel with ChangeNotifier {
 
   // mobile only
   updateScale(double v, Offset focalPoint) {
+    if (isFixedViewport) return;
     if (parent.target?.imageModel.image == null) return;
     final s = _scale;
     _scale *= v;
@@ -3239,6 +3273,16 @@ class CursorModel with ChangeNotifier {
     dx /= scale;
     dy /= scale;
     final r = getVisibleRect();
+    // Fixed viewport: keep the cursor inside the visible rect, never move the canvas.
+    if (parent.target?.canvasModel.isFixedViewport ?? false) {
+      final displayRect = parent.target?.ffiModel.rect;
+      final area = displayRect == null ? r : r.intersect(displayRect);
+      _x = (_x + dx).clamp(area.left, area.right);
+      _y = (_y + dy).clamp(area.top, area.bottom);
+      await parent.target?.inputModel.moveMouse(_x, _y);
+      notifyListeners();
+      return;
+    }
     var cx = r.center.dx;
     var cy = r.center.dy;
     var tryMoveCanvasX = false;

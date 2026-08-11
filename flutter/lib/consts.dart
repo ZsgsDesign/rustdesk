@@ -257,6 +257,11 @@ const Color kColorCanvas = Colors.black;
 const int kMobileDefaultDisplayWidth = 720;
 const int kMobileDefaultDisplayHeight = 1280;
 
+// Mobile only: lock the viewport to the central region of the remote display
+// with this aspect ratio (width / height), disabling pinch zoom and canvas pan.
+// Set to null to restore the default behavior.
+const double? kMobileFixedViewportAspectRatio = 16 / 9;
+
 const int kDesktopDefaultDisplayWidth = 1080;
 const int kDesktopDefaultDisplayHeight = 720;
 
