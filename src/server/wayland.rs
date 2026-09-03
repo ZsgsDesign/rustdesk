@@ -107,6 +107,26 @@ struct CapDisplayInfo {
     capturer: CapturerPtr,
 }
 
+/// Uinput desktop rect from the DRM display list, for a login screen where no compositor can be
+/// asked. `(minx, maxx, miny, maxy)`, in delivered-orientation physical pixels (a rotated
+/// output counts transposed, matching its frames): no compositor here applied a scale, so
+/// unlike `desktop_rect_of` there is no logical size to handle.
+#[cfg(feature = "drm")]
+fn drm_desktop_rect_for_uinput() -> Option<(i32, i32, i32, i32)> {
+    let displays = super::drm_capturer::get_display_infos()?;
+    if displays.is_empty() {
+        return None;
+    }
+    let minx = displays.iter().map(|d| d.x).min()?;
+    let miny = displays.iter().map(|d| d.y).min()?;
+    let maxx = displays.iter().map(|d| d.x + d.width).max()?;
+    let maxy = displays.iter().map(|d| d.y + d.height).max()?;
+    if maxx <= minx || maxy <= miny {
+        return None;
+    }
+    Some((minx, maxx, miny, maxy))
+}
+
 /// Set the uinput absolute-pointer range to the whole logical desktop so the compositor maps
 /// injected coordinates 1:1 instead of stretching a single-monitor range across all outputs. The
 /// PipeWire path does this inline in `check_init`; the DRM path bypasses check_init so it must do it
@@ -134,17 +154,41 @@ pub(super) async fn update_uinput_resolution() {
     if !crate::input_service::wayland_use_uinput() {
         return;
     }
-    scrap::wayland::display::clear_wayland_displays_cache();
-    let Some(rect) = scrap::wayland::display::get_desktop_rect_for_uinput() else {
-        log::warn!("Failed to get desktop rect for uinput");
-        return;
+    // Compositor first at a login screen too: a greeter runs one, and the hbb_common socket
+    // fallback reaches it with no environment variables. The DRM union is the fallback, and it is
+    // a real loss to land there on a multi-monitor host: DRM has no origins, so its union rect
+    // mis-maps the pointer whenever the compositor arranged the outputs side by side.
+    //
+    // Off the executor: the compositor query can block for the socket probe deadline, and this
+    // runs on current-thread runtimes (session init and the hotplug worker). The layout baseline
+    // is computed in the SAME task: a failed lookup is not cached, so asking for the rects
+    // afterwards would rerun the whole socket probe synchronously.
+    let (rect, layout) = match hbb_common::tokio::task::spawn_blocking(|| {
+        scrap::wayland::display::clear_wayland_displays_cache();
+        match scrap::wayland::display::get_desktop_rect_for_uinput() {
+            // The lookup above just cached the displays, so the rects come from that snapshot.
+            Some(rect) => Some((rect, scrap::wayland::display::get_display_rects_for_uinput())),
+            // Raw DRM union: there is no compositor layout to baseline. Empty keeps the #15601
+            // remap inactive, which is right when the origins are unknown anyway.
+            None => drm_desktop_rect_for_uinput().map(|rect| (rect, Vec::new())),
+        }
+    })
+    .await
+    {
+        Ok(Some(pair)) => pair,
+        Ok(None) => {
+            log::warn!("Failed to get desktop rect for uinput");
+            return;
+        }
+        Err(err) => {
+            log::warn!("The desktop rect probe task failed: {err}");
+            return;
+        }
     };
     // Re-snapshot the baseline on every call: this runs at session init and after every hotplug, and
     // the baseline is what the client's coordinates are measured against.
     let snapshot_layout = || {
-        super::display_service::set_wayland_layout_baseline(
-            scrap::wayland::display::get_display_rects_for_uinput(),
-        );
+        super::display_service::set_wayland_layout_baseline(layout.clone());
     };
     // Reprogram the device only when the range actually changes. A display stuck in a rebuild loop
     // calls this about once a second, and reapplying an identical range is an IPC roundtrip plus a
@@ -331,10 +375,13 @@ pub(super) async fn get_displays_and_primary() -> ResultType<(Vec<DisplayInfo>, 
         // client had already been given. Properly async, so the executor is never blocked; on any
         // failure the cache serves as before.
         super::drm_capturer::refresh_displays_for_login().await;
-        if let Some(displays) = super::drm_capturer::get_display_infos() {
-            // DRM connector order is not the compositor's primary; resolve the real primary from
-            // the compositor layout (matched by normalized connector name), not a hardcoded index 0.
-            return Ok((displays, super::drm_capturer::get_primary_index()));
+        let snapshot = hbb_common::tokio::task::spawn_blocking(
+            super::drm_capturer::get_display_infos_and_primary,
+        )
+        .await
+        .map_err(|err| anyhow::anyhow!("Wayland display probe task failed: {err}"))?;
+        if let Some(snapshot) = snapshot {
+            return Ok(snapshot);
         }
     }
     check_init().await?;
@@ -475,11 +522,13 @@ pub(super) fn get_capturer_for_display(
                     // (scrap `common/wayland.rs`), i.e. `PipeWireCapturable.physical_size`.
                     // `try_fix_logical_size` only repairs the capturable's SEPARATE
                     // `logical_size` field and never touches `physical_size`, so the rect is not
-                    // logical. The advertised DRM geometry is physical too
-                    // (`augment_with_wayland_geometry` sets x/y/scale and deliberately leaves
-                    // width/height as the DRM mode). Dividing one side by the scale therefore
-                    // compares logical against physical and rejects the valid stream on exactly
-                    // the scaled outputs it was meant to rescue.
+                    // logical. The advertised DRM geometry is physical too, in DELIVERED
+                    // orientation: `augment_with_wayland_geometry` transposes width/height for a
+                    // 90/270 output (rustdesk#15886). Whether the portal's caps arrive rotated
+                    // is UNMEASURED on a rotated display (pipewiresrc does not apply
+                    // SPA_META_VideoTransform), so the size half accepts either orientation
+                    // rather than gambling a permanent offline on one of them. Dividing a side
+                    // by the scale would still be wrong: logical against physical.
                     //
                     // The size check is what tells one connector apart from the whole-desktop
                     // rect the portal usually exposes. It is skipped only when BOTH sides say
@@ -491,15 +540,35 @@ pub(super) fn get_capturer_for_display(
                     // a monitor on a card the service cannot open is missing from the DRM list
                     // while the compositor still drives it.
                     let single_display = single_display && cap_display_info.num == 1;
+                    // Exact orientation only: a transposed stream would be encoded at the
+                    // PipeWire dimensions while the client keeps the advertised (rotated) ones,
+                    // and no wayland path ever reconciles the two, so every frame would be
+                    // rejected client-side. Falling into the bail instead advertises the display
+                    // offline, which the client recovers from by re-enumerating.
+                    let size_matches = advertised.width as usize == rect.1
+                        && advertised.height as usize == rect.2;
+                    let transposed = advertised.width as usize == rect.2
+                        && advertised.height as usize == rect.1;
+                    // The single-display carve-out forgives a size DIFFERENCE (a Full Workspace
+                    // stream may report the workspace, not the mode), but never a transposed
+                    // pair: that is the same served-vs-advertised orientation split as above,
+                    // and it blanks the client the same way.
                     let consistent = advertised.x == rect.0 .0
                         && advertised.y == rect.0 .1
-                        && (single_display
-                            || (advertised.width as usize == rect.1
-                                && advertised.height as usize == rect.2));
+                        && (size_matches || (single_display && !transposed));
                     if !consistent {
+                        // Recorded so the lone-display carve-out in `mark_demoted_displays` makes
+                        // the "advertised offline" below true for a single display too, instead of
+                        // restart-looping against a stream nothing can serve.
+                        super::drm_capturer::mark_fallback_rejected(display_idx);
                         bail!(
-                            "drm display {} demoted with no geometry-consistent PipeWire stream (advertised {}x{}+{}+{} vs stream {}x{}+{}+{}); advertised offline",
+                            "drm display {} demoted with no geometry-consistent PipeWire stream{} (advertised {}x{}+{}+{} vs stream {}x{}+{}+{}); advertised offline",
                             display_idx,
+                            if transposed {
+                                " - stream is transposed vs advertised"
+                            } else {
+                                ""
+                            },
                             advertised.width,
                             advertised.height,
                             advertised.x,

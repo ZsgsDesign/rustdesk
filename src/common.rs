@@ -105,7 +105,7 @@ lazy_static::lazy_static! {
     // Is server logic running. The server code can invoked to run by the main process if --server is not running.
     static ref SERVER_RUNNING: Arc<RwLock<bool>> = Default::default();
     static ref IS_MAIN: bool = std::env::args().nth(1).map_or(true, |arg| !arg.starts_with("--"));
-    static ref IS_CM: bool = std::env::args().nth(1) == Some("--cm".to_owned()) || std::env::args().nth(1) == Some("--cm-no-ui".to_owned());
+    static ref IS_CM: bool = std::env::args().nth(1) == Some("--cm".to_owned());
 }
 
 pub struct SimpleCallOnReturn {
@@ -122,6 +122,8 @@ impl Drop for SimpleCallOnReturn {
 }
 
 pub fn global_init() -> bool {
+    #[cfg(all(target_os = "linux", feature = "drm"))]
+    crate::platform::linux::dispatch_wayland_display_probe();
     #[cfg(target_os = "linux")]
     {
         if !crate::platform::linux::is_x11() {
@@ -218,6 +220,61 @@ pub fn need_fs_cm_send_files() -> bool {
     {
         false
     }
+}
+
+/// Android is scoped-storage only: the peer may never touch anything outside the app
+/// workspace (`Config::get_home()`, i.e. the app-specific external files directory).
+///
+/// Every peer supplied path must be validated with this before it reaches the
+/// filesystem, for reads, writes, renames, creations and deletions alike. The path is
+/// resolved to its canonical form (of the deepest existing ancestor, so paths that are
+/// about to be created are handled too) so symlinks cannot escape the workspace.
+///
+/// Only the `ReadDir` protocol action treats an empty path as the home directory.
+/// Callers must opt in to that protocol-specific behavior with `allow_empty`.
+#[cfg(target_os = "android")]
+pub fn is_peer_path_allowed(path: &str, allow_empty: bool) -> bool {
+    use std::path::{Component, Path, PathBuf};
+
+    // Canonicalize the deepest existing ancestor and re-append the missing tail.
+    fn resolve(path: &Path) -> Option<PathBuf> {
+        let mut tail: Vec<std::ffi::OsString> = Vec::new();
+        let mut base = path.to_path_buf();
+        loop {
+            if let Ok(mut resolved) = base.canonicalize() {
+                while let Some(component) = tail.pop() {
+                    resolved.push(component);
+                }
+                return Some(resolved);
+            }
+            tail.push(base.file_name()?.to_os_string());
+            if !base.pop() {
+                return None;
+            }
+        }
+    }
+
+    if path.is_empty() {
+        return allow_empty;
+    }
+    let path = Path::new(path);
+    // `..` is never needed by the protocol and would defeat the prefix check below.
+    if !path.is_absolute() || path.components().any(|c| c == Component::ParentDir) {
+        return false;
+    }
+    let home = Config::get_home();
+    let home = home.canonicalize().unwrap_or(home);
+    if home.as_os_str().is_empty() {
+        return false;
+    }
+    // `Path::starts_with` compares whole components, and is true for equal paths.
+    resolve(path).map_or(false, |target| target.starts_with(&home))
+}
+
+#[inline]
+#[cfg(not(target_os = "android"))]
+pub fn is_peer_path_allowed(_path: &str, _allow_empty: bool) -> bool {
+    true
 }
 
 #[inline]
@@ -1085,8 +1142,15 @@ fn get_api_server_(api: String, custom: String) -> String {
 
 #[inline]
 pub fn is_public(url: &str) -> bool {
-    let url = url.to_ascii_lowercase();
-    url.contains("rustdesk.com/") || url.ends_with("rustdesk.com")
+    let parsed = url::Url::parse(url)
+        .ok()
+        .filter(|parsed| parsed.has_host())
+        .or_else(|| url::Url::parse(&format!("http://{url}")).ok());
+    let Some(host) = parsed.as_ref().and_then(url::Url::host_str) else {
+        return false;
+    };
+    let host = host.strip_suffix('.').unwrap_or(host);
+    host == "rustdesk.com" || host.ends_with(".rustdesk.com")
 }
 
 pub fn get_udp_punch_enabled() -> bool {
@@ -2876,6 +2940,16 @@ mod tests {
         assert!(!is_public("localhost"));
         assert!(!is_public("https://rustdesk.computer.com"));
         assert!(!is_public("rustdesk.comhello.com"));
+    }
+
+    #[test]
+    fn test_is_public_matches_rustdesk_root_domain() {
+        assert!(is_public("rustdesk.com/"));
+        assert!(is_public("rustdesk.com:21117"));
+        assert!(is_public("api.rustdesk.com:21117"));
+        assert!(!is_public("hello-rustdesk.com"));
+        assert!(!is_public("api.rustdesk.com.evil.test"));
+        assert!(!is_public("https://rustdesk.com@evil.test"));
     }
 
     #[test]
