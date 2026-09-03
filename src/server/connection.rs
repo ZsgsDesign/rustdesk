@@ -325,6 +325,7 @@ pub struct Connection {
     delayed_read_dir: Option<(String, bool)>,
     #[cfg(target_os = "macos")]
     retina: Retina,
+    mobile_scale: super::mobile_scale::MobileScale,
     follow_remote_cursor: bool,
     follow_remote_window: bool,
     multi_ui_session: bool,
@@ -531,6 +532,7 @@ impl Connection {
             delayed_read_dir: None,
             #[cfg(target_os = "macos")]
             retina: Retina::default(),
+            mobile_scale: Default::default(),
             tx_from_authed,
             printer_data: Vec::new(),
             tx_post_seq,
@@ -949,6 +951,7 @@ impl Connection {
                             video_service::notify_video_frame_fetched(vf.display as usize, id, Some(instant.into()));
                         }
                     }
+                    let value = conn.mobile_scale.scale_shared(value, conn.display_idx);
                     if let Err(err) = conn.stream.send(&value as &Message).await {
                         conn.on_close(&err.to_string(), false).await;
                         break;
@@ -983,6 +986,7 @@ impl Connection {
                             conn.refresh_video_display(None);
                             #[cfg(target_os = "macos")]
                             conn.retina.set_displays(&_pi.displays);
+                            conn.mobile_scale.set_displays(&_pi.displays);
                         }
                         Some(message::Union::CursorPosition(pos)) => {
                             #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -1009,6 +1013,7 @@ impl Connection {
                         _ => {}
                     }
 
+                    let msg = conn.mobile_scale.scale_shared(msg, conn.display_idx);
                     let msg: &Message = &msg;
                     if let Err(err) = conn.stream.send(msg).await {
                         conn.on_close(&err.to_string(), false).await;
@@ -1985,6 +1990,10 @@ impl Connection {
                     {
                         self.retina.set_displays(&displays);
                     }
+                    if super::mobile_scale::is_mobile_platform(&self.lr.my_platform) {
+                        self.mobile_scale.enable();
+                    }
+                    self.mobile_scale.set_displays(&displays);
                     // A separate primary lookup here could race with display hot-plug.
                     self.display_idx = primary_display_idx;
                     pi.displays = displays;
@@ -2979,6 +2988,8 @@ impl Connection {
                     if let Err(e) = call_main_service_pointer_input("mouse", me.mask, me.x, me.y) {
                         log::debug!("call_main_service_pointer_input fail:{}", e);
                     }
+                    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                    self.mobile_scale.on_mouse_event(&mut me, self.display_idx);
                     #[cfg(not(any(target_os = "android", target_os = "ios")))]
                     if self.peer_keyboard_enabled() {
                         if is_left_up(&me) {
@@ -5365,6 +5376,8 @@ impl Connection {
 
     #[inline]
     async fn send(&mut self, msg: Message) {
+        let mut msg = msg;
+        self.mobile_scale.scale_msg(&mut msg, self.display_idx);
         allow_err!(self.stream.send(&msg).await);
     }
 

@@ -572,6 +572,17 @@ fn run(vs: VideoService) -> ResultType<()> {
         log::info!("disable dxgi with option, fall back to gdi");
         c.set_gdi();
     }
+    let mobile_scale = if vs.source.is_monitor() {
+        super::mobile_scale::current(c.width, c.height)
+    } else {
+        None
+    };
+    let (encode_width, encode_height) = mobile_scale
+        .map(|s| (s.out_w, s.out_h))
+        .unwrap_or((c.width, c.height));
+    if let Some(s) = mobile_scale {
+        log::info!("mobile scale: {s:?}");
+    }
     let mut video_qos = VIDEO_QOS.lock().unwrap();
     let mut spf = video_qos.spf();
     let mut quality = video_qos.ratio();
@@ -590,13 +601,14 @@ fn run(vs: VideoService) -> ResultType<()> {
         last_portable_service_running,
         vs.source,
         display_idx,
+        mobile_scale,
     ) {
         Ok(result) => result,
         Err(err) => {
             log::error!("Failed to create encoder: {err:?}, fallback to VP9");
             Encoder::set_fallback(&EncoderCfg::VPX(VpxEncoderConfig {
-                width: c.width as _,
-                height: c.height as _,
+                width: encode_width as _,
+                height: encode_height as _,
                 quality,
                 codec: VpxVideoCodecId::VP9,
                 keyframe_interval: None,
@@ -610,6 +622,7 @@ fn run(vs: VideoService) -> ResultType<()> {
                 last_portable_service_running,
                 vs.source,
                 display_idx,
+                mobile_scale,
             )?
         }
     };
@@ -648,12 +661,13 @@ fn run(vs: VideoService) -> ResultType<()> {
     let mut would_block_count = 0u32;
     let mut yuv = Vec::new();
     let mut mid_data = Vec::new();
+    let mut scaled_data = Vec::new();
     let mut repeat_encode_counter = 0;
     let repeat_encode_max = 10;
     let mut encode_fail_counter = 0;
     let mut first_frame = true;
-    let capture_width = c.width;
-    let capture_height = c.height;
+    let capture_width = encode_width;
+    let capture_height = encode_height;
     let (mut second_instant, mut send_counter) = (Instant::now(), 0);
 
     while sp.ok() {
@@ -668,6 +682,12 @@ fn run(vs: VideoService) -> ResultType<()> {
             &mut second_instant,
             &sp.name(),
         )?;
+        if vs.source.is_monitor()
+            && mobile_scale != super::mobile_scale::current(c.width, c.height)
+        {
+            log::info!("switch due to mobile scale changed");
+            bail!("SWITCH");
+        }
         if sp.is_option_true(OPTION_REFRESH) {
             if vs.source.is_monitor() {
                 let _ = try_broadcast_display_changed(&sp, display_idx, &c, true);
@@ -772,7 +792,17 @@ fn run(vs: VideoService) -> ResultType<()> {
                         }
                     }
 
-                    let frame = frame.to(encoder.yuvfmt(), &mut yuv, &mut mid_data)?;
+                    let frame = match mobile_scale {
+                        Some(s) => frame.to_scaled(
+                            encoder.yuvfmt(),
+                            &mut yuv,
+                            &mut mid_data,
+                            &mut scaled_data,
+                            (s.crop_x, s.crop_y, s.crop_w, s.crop_h),
+                            (s.out_w, s.out_h),
+                        )?,
+                        None => frame.to(encoder.yuvfmt(), &mut yuv, &mut mid_data)?,
+                    };
                     let send_conn_ids = handle_one_frame(
                         display_idx,
                         &sp,
@@ -939,6 +969,7 @@ fn setup_encoder(
     last_portable_service_running: bool,
     source: VideoSource,
     display_idx: usize,
+    mobile_scale: Option<super::mobile_scale::ScaleRect>,
 ) -> ResultType<(
     Encoder,
     EncoderCfg,
@@ -953,6 +984,7 @@ fn setup_encoder(
         client_record || record_incoming,
         last_portable_service_running,
         source,
+        mobile_scale,
     );
     Encoder::set_fallback(&encoder_cfg);
     let codec_format = Encoder::negotiated_codec();
@@ -969,12 +1001,21 @@ fn get_encoder_config(
     record: bool,
     _portable_service: bool,
     _source: VideoSource,
+    mobile_scale: Option<super::mobile_scale::ScaleRect>,
 ) -> EncoderCfg {
+    // Texture frames cannot be cropped/scaled on the CPU path, so VRAM encoding is skipped.
     #[cfg(all(windows, feature = "vram"))]
-    if _portable_service || c.is_gdi() || _source == VideoSource::Camera {
+    if _portable_service
+        || c.is_gdi()
+        || _source == VideoSource::Camera
+        || mobile_scale.is_some()
+    {
         log::info!("gdi:{}, portable:{}", c.is_gdi(), _portable_service);
         VRamEncoder::set_not_use(_name, true);
     }
+    let (width, height) = mobile_scale
+        .map(|s| (s.out_w, s.out_h))
+        .unwrap_or((c.width, c.height));
     #[cfg(feature = "vram")]
     Encoder::update(scrap::codec::EncodingUpdate::Check);
     // https://www.wowza.com/community/t/the-correct-keyframe-interval-in-obs-studio/95162
@@ -986,8 +1027,8 @@ fn get_encoder_config(
             if let Some(feature) = VRamEncoder::try_get(&c.device(), negotiated_codec) {
                 return EncoderCfg::VRAM(VRamEncoderConfig {
                     device: c.device(),
-                    width: c.width,
-                    height: c.height,
+                    width,
+                    height,
                     quality,
                     feature,
                     keyframe_interval,
@@ -998,23 +1039,23 @@ fn get_encoder_config(
                 return EncoderCfg::HWRAM(HwRamEncoderConfig {
                     name: hw.name,
                     mc_name: hw.mc_name,
-                    width: c.width,
-                    height: c.height,
+                    width,
+                    height,
                     quality,
                     keyframe_interval,
                 });
             }
             EncoderCfg::VPX(VpxEncoderConfig {
-                width: c.width as _,
-                height: c.height as _,
+                width: width as _,
+                height: height as _,
                 quality,
                 codec: VpxVideoCodecId::VP9,
                 keyframe_interval,
             })
         }
         format @ (CodecFormat::VP8 | CodecFormat::VP9) => EncoderCfg::VPX(VpxEncoderConfig {
-            width: c.width as _,
-            height: c.height as _,
+            width: width as _,
+            height: height as _,
             quality,
             codec: if format == CodecFormat::VP8 {
                 VpxVideoCodecId::VP8
@@ -1024,14 +1065,14 @@ fn get_encoder_config(
             keyframe_interval,
         }),
         CodecFormat::AV1 => EncoderCfg::AOM(AomEncoderConfig {
-            width: c.width as _,
-            height: c.height as _,
+            width: width as _,
+            height: height as _,
             quality,
             keyframe_interval,
         }),
         _ => EncoderCfg::VPX(VpxEncoderConfig {
-            width: c.width as _,
-            height: c.height as _,
+            width: width as _,
+            height: height as _,
             quality,
             codec: VpxVideoCodecId::VP9,
             keyframe_interval,

@@ -207,6 +207,33 @@ impl Frame<'_> {
             Frame::Texture(texture) => Ok(EncodeInput::Texture(*texture)),
         }
     }
+
+    // Like `to`, but only the `crop` (x, y, w, h) region is kept, scaled to `dst_size`.
+    pub fn to_scaled<'a>(
+        &'a self,
+        yuvfmt: EncodeYuvFormat,
+        yuv: &'a mut Vec<u8>,
+        mid_data: &mut Vec<u8>,
+        scaled: &mut Vec<u8>,
+        crop: (usize, usize, usize, usize),
+        dst_size: (usize, usize),
+    ) -> ResultType<EncodeInput<'a>> {
+        match self {
+            Frame::PixelBuffer(pixelbuffer) => {
+                convert::convert_to_yuv_scaled(
+                    &pixelbuffer,
+                    crop,
+                    dst_size,
+                    yuvfmt,
+                    yuv,
+                    mid_data,
+                    scaled,
+                )?;
+                Ok(EncodeInput::YUV(yuv))
+            }
+            Frame::Texture(texture) => Ok(EncodeInput::Texture(*texture)),
+        }
+    }
 }
 
 pub enum EncodeInput<'a> {
