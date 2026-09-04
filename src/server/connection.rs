@@ -4576,6 +4576,12 @@ impl Connection {
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn change_resolution(&mut self, d: Option<usize>, r: &Resolution) {
+        // A mobile-scaled peer only sees scaled geometry; its resolution
+        // requests must never touch the real display.
+        if self.mobile_scale.enabled() {
+            log::info!("ignore resolution change {}x{} from mobile-scaled peer", r.width, r.height);
+            return;
+        }
         if self.keyboard {
             if let Ok(displays) = display_service::try_get_displays() {
                 let display_idx = d.unwrap_or(self.display_idx);

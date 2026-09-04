@@ -78,6 +78,11 @@ impl MobileScale {
     }
 
     #[inline]
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    #[inline]
     pub fn set_displays(&mut self, displays: &[DisplayInfo]) {
         if self.enabled {
             self.displays = displays.to_vec();
@@ -92,11 +97,19 @@ impl MobileScale {
         Some((d, compute(d.width as usize, d.height as usize)))
     }
 
+    // `original_resolution` is set to the scaled size too, so the peer never
+    // records a custom resolution and asks us to change the real display.
     fn scale_display(d: &mut DisplayInfo) {
         if d.width > 0 && d.height > 0 {
             let r = compute(d.width as usize, d.height as usize);
             d.width = r.out_w as _;
             d.height = r.out_h as _;
+            d.original_resolution = Some(Resolution {
+                width: d.width,
+                height: d.height,
+                ..Default::default()
+            })
+            .into();
         }
     }
 
@@ -123,6 +136,12 @@ impl MobileScale {
                         let r = compute(sd.width as usize, sd.height as usize);
                         sd.width = r.out_w as _;
                         sd.height = r.out_h as _;
+                        sd.original_resolution = Some(Resolution {
+                            width: sd.width,
+                            height: sd.height,
+                            ..Default::default()
+                        })
+                        .into();
                     }
                     true
                 }
